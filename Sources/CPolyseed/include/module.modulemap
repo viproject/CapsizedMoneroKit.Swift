@@ -1,0 +1,4 @@
+module CPolyseed {
+    header "../polyseed_validate.h"
+    export *
+}
