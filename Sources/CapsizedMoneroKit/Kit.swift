@@ -22,14 +22,38 @@ public class Kit {
     private var lastRotationAttempt: Date?
     private let reachabilityManager: ReachabilityManager
 
+    public let nodeRotationMode: NodeRotationMode
+
+    // MARK: - `.adaptive` rotation state (unused, untouched under `.legacy`)
+
+    private var nodeWatchdog: NodeWatchdog?
+    private var rotationInFlight = false
+    private var nextRotationAllowedAt: Date = .distantPast
+    private var nextRotationBackoff: TimeInterval = 20
+    private var consecutiveStallRotations = 0
+    private var slowRotationIneffectiveCount = 0
+    private var throughputDetectorArmed = true
+    private var lastHealthSample: ActiveNodeSample?
+
     public let nodePool: NodePool
     public weak var delegate: CapsizedMoneroKitDelegate?
 
-    public init(wallet: MoneroWallet, restoreHeight: UInt64 = 0, walletId: String, walletPassword: String? = nil, nodes: [Node], networkType: NetworkType = .mainnet, isNewWallet: Bool = false, reachabilityManager: ReachabilityManager, logger: HsToolKit.Logger?, moneroCoreLogLevel: Int32? = nil) throws {
+    /// When false, automatic rotation off the current node on repeated sync failures is
+    /// disabled — used to honor a user's manually pinned node. Gates `attemptNodeRotation()`
+    /// under `.legacy` and the watchdog-driven rotation cycle under `.adaptive`.
+    public var isAutoNodeSelectionEnabled: Bool = true
+
+    @available(*, deprecated, message: "Use init(..., nodeRotationMode:) to opt into adaptive node health monitoring and rotation, introduced in 1.1.0. This initializer keeps the 1.0.0 behavior unchanged and will be removed in a future major version.")
+    public convenience init(wallet: MoneroWallet, restoreHeight: UInt64 = 0, walletId: String, walletPassword: String? = nil, nodes: [Node], networkType: NetworkType = .mainnet, isNewWallet: Bool = false, reachabilityManager: ReachabilityManager, logger: HsToolKit.Logger?, moneroCoreLogLevel: Int32? = nil) throws {
+        try self.init(wallet: wallet, restoreHeight: restoreHeight, walletId: walletId, walletPassword: walletPassword, nodes: nodes, networkType: networkType, isNewWallet: isNewWallet, reachabilityManager: reachabilityManager, logger: logger, moneroCoreLogLevel: moneroCoreLogLevel, nodeRotationMode: .legacy)
+    }
+
+    public init(wallet: MoneroWallet, restoreHeight: UInt64 = 0, walletId: String, walletPassword: String? = nil, nodes: [Node], networkType: NetworkType = .mainnet, isNewWallet: Bool = false, reachabilityManager: ReachabilityManager, logger: HsToolKit.Logger?, moneroCoreLogLevel: Int32? = nil, nodeRotationMode: NodeRotationMode, preferredNodeURL: URL? = nil) throws {
         precondition(!nodes.isEmpty, "At least one node is required")
 
         self.reachabilityManager = reachabilityManager
-        nodePool = NodePool(nodes: nodes)
+        self.nodeRotationMode = nodeRotationMode
+        nodePool = NodePool(nodes: nodes, mode: nodeRotationMode, preferredActive: preferredNodeURL)
         nodePool.isNetworkReachable = { [weak reachabilityManager] in
             reachabilityManager?.isReachable ?? false
         }
@@ -89,9 +113,15 @@ public class Kit {
         }
 
         subscribeToBackgroundNotifications()
-        
+
+        if nodeRotationMode == .adaptive {
+            nodeWatchdog = NodeWatchdog()
+            moneroCore.onHealthSample = { [weak self] sample in
+                self?.lifecycleQueue.async { self?.processHealthSample(sample) }
+            }
+        }
     }
-    
+
     private func subscribeToBackgroundNotifications() {
         NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)
             .sink { [weak self] _ in
@@ -117,6 +147,9 @@ public class Kit {
             guard let self, started else { return }
             handledForegroundFromExpiredBackground = false
             moneroCore.pause()
+            if nodeRotationMode == .adaptive {
+                nodePool.stopAdaptiveProbing()
+            }
         }
     }
     
@@ -133,6 +166,12 @@ public class Kit {
             guard let self, started else { return }
             if !handledForegroundFromExpiredBackground {
                 moneroCore.resume()
+            }
+            if nodeRotationMode == .adaptive {
+                nodePool.startAdaptiveProbing(isSynced: { [weak self] in
+                    guard case .synced = self?.moneroCore.state else { return false }
+                    return true
+                })
             }
         }
     }
@@ -283,7 +322,16 @@ public class Kit {
         moneroCore.setConnectingState(waiting: false)
         lifecycleQueue.async { [weak self] in self?._start() }
         nodePool.probeAllNodes()
-        nodePool.startProbing()
+
+        switch nodeRotationMode {
+        case .legacy:
+            nodePool.startProbing()
+        case .adaptive:
+            nodePool.startAdaptiveProbing(isSynced: { [weak self] in
+                guard case .synced = self?.moneroCore.state else { return false }
+                return true
+            })
+        }
     }
 
     /// Delivers cached storage data to the delegate immediately, before the network sync begins.
@@ -302,11 +350,17 @@ public class Kit {
     }
 
     public func stop() {
-        nodePool.stopProbing()
+        switch nodeRotationMode {
+        case .legacy:
+            nodePool.stopProbing()
+        case .adaptive:
+            nodePool.stopAdaptiveProbing()
+        }
         lifecycleQueue.async { [weak self] in self?._stop() }
     }
 
     private func attemptNodeRotation() {
+        guard isAutoNodeSelectionEnabled else { return }
         guard reachabilityManager.isReachable else { return }
 
         let now = Date()
@@ -328,6 +382,141 @@ public class Kit {
                 self.delegate?.activeNodeDidChange(node: newNode)
             } catch {
                 // switchNode failed for the new node too — will retry next cycle
+            }
+        }
+    }
+
+    // MARK: - `.adaptive` rotation cycle (new in 1.1.0, unused under `.legacy`)
+
+    /// Runs on `lifecycleQueue` — one poll tick's worth of health data, evaluated against the
+    /// watchdog. A verdict kicks off `performAdaptiveRotation(reason:)` on its own `Task`;
+    /// `rotationInFlight` (checked inside that method) keeps overlapping ticks from starting a
+    /// second cycle while one is already in progress.
+    private func processHealthSample(_ sample: ActiveNodeSample) {
+        guard nodeRotationMode == .adaptive, let nodeWatchdog else { return }
+        lastHealthSample = sample
+
+        let activeNode = nodePool.activeNode
+        let bestCandidate = nodePool.adaptiveBestCandidates(excluding: activeNode).first
+        let snapshot = PoolSnapshot(
+            maxSeenHeight: nodePool.currentMaxSeenHeight,
+            activeLatencyEWMA: nodePool.nodeMetrics(for: activeNode)?.latencyEWMA,
+            bestCandidateLatencyEWMA: bestCandidate.flatMap { nodePool.nodeMetrics(for: $0)?.latencyEWMA },
+            hasMateriallyBetterCandidate: nodePool.hasCandidateMateriallyBetterThanActive(),
+            isThroughputDetectorArmed: throughputDetectorArmed
+        )
+
+        guard let verdict = nodeWatchdog.evaluate(sample: sample, snapshot: snapshot) else { return }
+        let reason: NodeVerdictReason
+        switch verdict {
+        case let .hard(r): reason = r
+        case let .slow(r): reason = r
+        }
+
+        Task { [weak self] in
+            await self?.performAdaptiveRotation(reason: reason)
+        }
+    }
+
+    /// Verify-before-commit rotation cycle (§5): quarantines the current node, ranks
+    /// candidates, probes the top few fresh before committing to any of them, and backs off
+    /// rather than retrying every cycle when nothing works. Not a public method, not a variant
+    /// of `rotateToNextBest()` — an independent cycle that only runs under `.adaptive`.
+    private func performAdaptiveRotation(reason: NodeVerdictReason) async {
+        guard isAutoNodeSelectionEnabled, reachabilityManager.isReachable, !rotationInFlight else { return }
+        if reason == .hardStall, consecutiveStallRotations >= 3 { return }
+
+        let now = Date()
+        guard now >= nextRotationAllowedAt else { return }
+        guard nodePool.nodes.count > 1 else { return }
+
+        rotationInFlight = true
+        defer { rotationInFlight = false }
+
+        let current = moneroCore.node
+        nodePool.quarantine(current)
+
+        let candidates = nodePool.adaptiveBestCandidates(excluding: current)
+        guard !candidates.isEmpty else {
+            applyRotationBackoff()
+            return
+        }
+
+        let ranked = await nodePool.refreshAndRank(Array(candidates.prefix(3)))
+
+        for candidate in ranked {
+            guard started else { return }
+            do {
+                try await switchNodeAwaitingHandshake(candidate)
+                commitAdaptiveRotation(to: candidate, reason: reason)
+                return
+            } catch {
+                nodePool.quarantine(candidate)
+                continue
+            }
+        }
+
+        applyRotationBackoff()
+    }
+
+    /// `moneroCore.switchNode` only confirms the daemon accepted the connection parameters, not
+    /// that it is actually responsive — so this polls `blockHeights` for up to 12s afterward,
+    /// mirroring the "verify before commit" intent of §5's pseudocode.
+    private func switchNodeAwaitingHandshake(_ node: Node) async throws {
+        try moneroCore.switchNode(node)
+
+        let deadline = Date().addingTimeInterval(12)
+        while Date() < deadline {
+            if (moneroCore.blockHeights?.1 ?? 0) > 0 { return }
+            try await Task.sleep(nanoseconds: 500_000_000)
+        }
+        throw MoneroCoreError.daemonInitFailed("handshake timed out")
+    }
+
+    private func commitAdaptiveRotation(to node: Node, reason: NodeVerdictReason) {
+        notSyncedSince = nil
+        nodePool.setActive(node)
+        nodeWatchdog?.armPostSwitchGrace()
+        nextRotationAllowedAt = Date().addingTimeInterval(20)
+        nextRotationBackoff = 20
+        delegate?.activeNodeDidChange(node: node)
+
+        os_log(.info, log: Kit.log, "Adaptive rotation: switched to %{public}@ (reason: %{public}@)",
+               node.url.absoluteString, reason.rawValue)
+
+        switch reason {
+        case .hardStall:
+            consecutiveStallRotations += 1
+        case .slowThroughput:
+            scheduleSlowThroughputEffectivenessCheck()
+        default:
+            break
+        }
+    }
+
+    /// All rotation attempts on this cycle failed to produce a working node — back off instead
+    /// of retrying every tick, doubling up to a 5-minute cap.
+    private func applyRotationBackoff() {
+        nextRotationAllowedAt = Date().addingTimeInterval(nextRotationBackoff)
+        nextRotationBackoff = min(nextRotationBackoff * 2, 300)
+    }
+
+    /// §4.4.3's self-correction: re-measure throughput 90s after a slowness-triggered rotation;
+    /// if it didn't meaningfully improve, count it as ineffective. After 2 ineffective attempts,
+    /// disarm the throughput detector for the rest of the session rather than keep oscillating
+    /// between nodes that are all equally fine.
+    private func scheduleSlowThroughputEffectivenessCheck() {
+        let baselineBps = lastHealthSample?.blocksPerSecond ?? 0
+        lifecycleQueue.asyncAfter(deadline: .now() + 90) { [weak self] in
+            guard let self else { return }
+            let newBps = self.lastHealthSample?.blocksPerSecond ?? 0
+            let improved = baselineBps > 0 ? (newBps >= baselineBps * 1.3) : newBps > 0
+            guard !improved else { return }
+
+            self.slowRotationIneffectiveCount += 1
+            if self.slowRotationIneffectiveCount >= 2 {
+                self.throughputDetectorArmed = false
+                os_log(.info, log: Kit.log, "Adaptive rotation: disarming throughput detector for the session after %d ineffective rotations", self.slowRotationIneffectiveCount)
             }
         }
     }
@@ -443,15 +632,22 @@ public class Kit {
         return moneroCore.numberOfAccounts()
     }
     
-    public func switchToNode(_ node: Node) {
-        lifecycleQueue.async { [weak self] in
-            guard let self, self.started else { return }
+    public func switchToNode(_ node: Node, completion: ((Result<Void, Error>) -> Void)? = nil) {
+        // QoS override only for this block — a user-initiated tap shouldn't inherit the
+        // queue's .background baseline used by backgrounding/pause/resume housekeeping.
+        lifecycleQueue.async(qos: .userInitiated) { [weak self] in
+            guard let self, self.started else {
+                DispatchQueue.main.async { completion?(.failure(MoneroCoreError.walletNotInitialized)) }
+                return
+            }
             do {
                 try self.moneroCore.switchNode(node)
                 self.notSyncedSince = nil
+                self.nodePool.setActive(node)
                 self.delegate?.activeNodeDidChange(node: node)
+                DispatchQueue.main.async { completion?(.success(())) }
             } catch {
-                // Failed to switch
+                DispatchQueue.main.async { completion?(.failure(error)) }
             }
         }
     }
@@ -500,40 +696,70 @@ extension Kit: MoneroCoreDelegate {
             storage.update(blockHeights: BlockHeights(daemonHeight: Int(daemonHeight), walletHeight: Int(walletHeight)))
         }
 
-        switch state {
-        case .synced:
-            notSyncedSince = nil
-            nodePool.markSuccess(node: moneroCore.node, responseTime: 0.5, height: moneroCore.blockHeights?.1 ?? 0)
-            ensureFreshSubaddressIfNeeded()
-        case .notSynced:
-            guard reachabilityManager.isReachable else {
+        switch nodeRotationMode {
+        case .legacy:
+            // Untouched — 1.0.0 behavior, exactly as it was.
+            switch state {
+            case .synced:
                 notSyncedSince = nil
-                break
-            }
-            if notSyncedSince == nil {
-                notSyncedSince = Date()
-            } else if let since = notSyncedSince, Date().timeIntervalSince(since) > 30 {
-                nodePool.markFailed(node: moneroCore.node)
-                attemptNodeRotation()
-            }
-        case .connecting:
-            guard reachabilityManager.isReachable else {
+                nodePool.markSuccess(node: moneroCore.node, responseTime: 0.5, height: moneroCore.blockHeights?.1 ?? 0)
+                ensureFreshSubaddressIfNeeded()
+            case .notSynced:
+                guard reachabilityManager.isReachable else {
+                    notSyncedSince = nil
+                    break
+                }
+                if notSyncedSince == nil {
+                    notSyncedSince = Date()
+                } else if let since = notSyncedSince, Date().timeIntervalSince(since) > 30 {
+                    nodePool.markFailed(node: moneroCore.node)
+                    attemptNodeRotation()
+                }
+            case .connecting:
+                guard reachabilityManager.isReachable else {
+                    notSyncedSince = nil
+                    break
+                }
+                if notSyncedSince == nil {
+                    notSyncedSince = Date()
+                } else if let since = notSyncedSince, Date().timeIntervalSince(since) > 45 {
+                    nodePool.markFailed(node: moneroCore.node)
+                    attemptNodeRotation()
+                }
+            case .syncing:
                 notSyncedSince = nil
+            case .idle(let daemonReachable):
+                if daemonReachable {
+                    nodePool.resetAllFailures()
+                }
+                notSyncedSince = nil
+            }
+
+        case .adaptive:
+            // Rotation itself is driven by the watchdog via `onHealthSample`/
+            // `processHealthSample`, not by this state-change callback — so `.notSynced`,
+            // `.connecting`, and `.syncing` are no-ops here. Only `.synced` and `.idle` need
+            // mode-specific handling (real latency instead of a fabricated sample; decay
+            // instead of a full reset).
+            switch state {
+            case .synced:
+                if let height = moneroCore.blockHeights?.1 {
+                    nodePool.recordSyncedHeight(node: moneroCore.node, height: height)
+                }
+                nodeWatchdog?.clearAllDetectorState()
+                consecutiveStallRotations = 0
+                slowRotationIneffectiveCount = 0
+                throughputDetectorArmed = true
+                ensureFreshSubaddressIfNeeded()
+            case .notSynced, .connecting, .syncing:
                 break
+            case .idle(let daemonReachable):
+                if daemonReachable {
+                    nodePool.decayFailures()
+                } else {
+                    nodeWatchdog?.clearAllDetectorState()
+                }
             }
-            if notSyncedSince == nil {
-                notSyncedSince = Date()
-            } else if let since = notSyncedSince, Date().timeIntervalSince(since) > 45 {
-                nodePool.markFailed(node: moneroCore.node)
-                attemptNodeRotation()
-            }
-        case .syncing:
-            notSyncedSince = nil
-        case .idle(let daemonReachable):
-            if daemonReachable {
-                nodePool.resetAllFailures()
-            }
-            notSyncedSince = nil
         }
     }
 

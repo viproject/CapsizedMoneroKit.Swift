@@ -27,7 +27,20 @@ class SyncStateManager {
     private(set) var walletHeight: UInt64 = 0
     private(set) var blockHeights: (UInt64, UInt64)?
 
+    // MARK: - Health sampling (additive — `.adaptive` node-rotation path only)
+
+    /// Ring buffer of (timestamp, walletHeight), pruned to a 90s span. Used to compute
+    /// `blocksPerSecond` via a window-wide secant rather than an adjacent-sample derivative,
+    /// which would just read the staircase pattern of batched block fetches as noise.
+    private var heightSamples: [(Date, UInt64)] = []
+    private static let heightSampleWindow: TimeInterval = 90
+    private static let minimumSecantSpan: TimeInterval = 60
+
     var onSyncStateChanged: (() -> Void)?
+    /// Fired once per poll tick (additive, alongside `onSyncStateChanged` which only fires on
+    /// state *change*) — only assigned by `Kit` under `NodeRotationMode.adaptive`; under
+    /// `.legacy` it is simply never set, so this costs nothing beyond the ring buffer upkeep.
+    var onHealthSample: ((ActiveNodeSample) -> Void)?
 
     var state: WalletState = .notSynced(error: WalletStateError.notStarted) {
         didSet {
@@ -100,13 +113,15 @@ class SyncStateManager {
         walletHeight = MONERO_Wallet_blockChainHeight(walletPtr)
         isSynchronized = MONERO_Wallet_synchronized(walletPtr)
         let status = MONERO_Wallet_status(walletPtr)
+        recordHeightSample()
 
         if status != 0 {
             let errorCStr = MONERO_Wallet_errorString(walletPtr)
             let errorStr = stringFromCString(errorCStr)
             logger?.error("Wallet is in error state (\(status)): \(errorStr ?? "Unknown wallet error").")
             state = .notSynced(error: WalletStateError.statusError(errorStr))
-            
+            emitHealthSample(walletPtr: walletPtr, walletStatusError: errorStr)
+
             // Continue polling - the wallet may recover
             scheduleNextCheck()
 
@@ -119,14 +134,58 @@ class SyncStateManager {
 
         let previousDaemonHeight = daemonHeight
         daemonHeight = MONERO_Wallet_daemonBlockChainHeight(walletPtr)
-        
+
         if previousWalletHeight != walletHeight || previousDaemonHeight != daemonHeight {
             blockHeights = (walletHeight, daemonHeight)
         }
 
         state = evaluateState()
+        emitHealthSample(walletPtr: walletPtr, walletStatusError: nil)
 
         scheduleNextCheck()
+    }
+
+    private func recordHeightSample() {
+        let now = Date()
+        heightSamples.append((now, walletHeight))
+        heightSamples.removeAll { now.timeIntervalSince($0.0) > Self.heightSampleWindow }
+    }
+
+    /// Window-wide secant across the ring buffer — absorbs the staircase pattern of batched
+    /// block fetches. `nil` until the window spans at least `minimumSecantSpan`, meaning
+    /// "unknown, stay quiet" rather than "slow" for any consumer.
+    private var blocksPerSecond: Double? {
+        guard let oldest = heightSamples.first, let newest = heightSamples.last else { return nil }
+        let span = newest.0.timeIntervalSince(oldest.0)
+        guard span >= Self.minimumSecantSpan, newest.1 >= oldest.1 else { return nil }
+        return Double(newest.1 - oldest.1) / span
+    }
+
+    private func emitHealthSample(walletPtr: UnsafeMutableRawPointer, walletStatusError: String?) {
+        guard let onHealthSample else { return }
+
+        let daemonTargetHeight = MONERO_Wallet_daemonBlockChainTargetHeight(walletPtr)
+        let estimatedHeight = MONERO_Wallet_estimateBlockChainHeight(walletPtr)
+        let isPreRestorePhase = walletHeight < restoreHeight
+        let remainingBlocks: Int = {
+            guard daemonHeight > restoreHeight, walletHeight >= restoreHeight else { return 0 }
+            return max(0, Int(daemonHeight - restoreHeight) - Int(walletHeight - restoreHeight))
+        }()
+        let connectElapsed = connectStartTime.map { Date().timeIntervalSince($0) } ?? 0
+
+        onHealthSample(ActiveNodeSample(
+            at: Date(),
+            state: state,
+            walletHeight: walletHeight,
+            daemonHeight: daemonHeight,
+            daemonTargetHeight: daemonTargetHeight,
+            estimatedHeight: estimatedHeight,
+            remainingBlocks: remainingBlocks,
+            isPreRestorePhase: isPreRestorePhase,
+            walletStatusError: walletStatusError,
+            connectElapsed: connectElapsed,
+            blocksPerSecond: blocksPerSecond
+        ))
     }
 
     private func scheduleNextCheck() {
@@ -163,6 +222,10 @@ class SyncStateManager {
 
         walletPointer = nil
         cWalletPassword = nil
+
+        // Otherwise a fresh session's first blocksPerSecond reading would span the gap
+        // across the restart, looking like a valid measurement when it is not.
+        heightSamples.removeAll()
     }
 
     func walletStored() {
@@ -181,4 +244,24 @@ class SyncStateManager {
         case `default` = 1
         case customPassword = 2
     }
+}
+
+/// One poll tick's worth of sync-health data, emitted via `SyncStateManager.onHealthSample`.
+/// Consumed only by `NodeWatchdog` (`.adaptive` path) — additive, no legacy equivalent.
+struct ActiveNodeSample {
+    let at: Date
+    let state: WalletState
+    let walletHeight: UInt64
+    let daemonHeight: UInt64
+    let daemonTargetHeight: UInt64
+    /// Local, clock-based chain-height estimate. Diagnostic only — an earlier
+    /// draft used this to drive a "node height frozen" hard-fail detector, dropped because its
+    /// drift and Monero's naturally variable block interval made it prone to false positives.
+    let estimatedHeight: UInt64
+    let remainingBlocks: Int
+    let isPreRestorePhase: Bool
+    let walletStatusError: String?
+    let connectElapsed: TimeInterval
+    /// `nil` until the ring buffer spans at least 60s — "unknown", never "slow".
+    let blocksPerSecond: Double?
 }

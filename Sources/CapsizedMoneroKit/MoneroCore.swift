@@ -67,6 +67,14 @@ class MoneroCore {
         stateManager.blockHeights
     }
 
+    /// Pass-through to `SyncStateManager.onHealthSample` — `stateManager` is private, so `Kit`
+    /// (the `.adaptive` node-rotation path only) reaches it through this property rather than
+    /// through any change to `stateManager`'s own visibility.
+    var onHealthSample: ((ActiveNodeSample) -> Void)? {
+        get { stateManager.onHealthSample }
+        set { stateManager.onHealthSample = newValue }
+    }
+
     init(wallet: MoneroWallet, walletPath: String, walletPassword: String, node: Node, restoreHeight: UInt64, networkType: NetworkType, isNewWallet: Bool = false, reachabilityManager: ReachabilityManager, logger: Logger?, moneroCoreLogLevel: Int32?) {
         self.wallet = wallet
         self.isNewWallet = isNewWallet
@@ -570,6 +578,10 @@ class MoneroCore {
         guard initSuccess else {
             let errorCStr = MONERO_Wallet_errorString(walletPtr)
             let msg = stringFromCString(errorCStr) ?? "Unknown daemon init error"
+            // stopWalletServices() already ran above and startWalletServices() below is
+            // never reached, so without this the state manager is left stopped while
+            // walletState still reports whatever it was before the switch attempt.
+            stateManager.state = .notSynced(error: .startError(msg))
             throw MoneroCoreError.daemonInitFailed(msg)
         }
 
