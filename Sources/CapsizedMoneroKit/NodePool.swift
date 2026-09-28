@@ -99,7 +99,22 @@ public class NodePool {
         lock.lock()
         defer { lock.unlock() }
         guard !newNodes.isEmpty else { return }
+        let newByURL = Dictionary(newNodes.map { ($0.url, $0) }, uniquingKeysWith: { first, _ in first })
         let existingURLs = Set(nodes.map(\.url))
+
+        // Replace stored nodes whose URL already exists with the incoming instance, so an
+        // edit to login/password/isTrusted (URL unchanged) is picked up rather than silently
+        // ignored — `Node` equality only compares `url`, so appending wouldn't do this.
+        // `metrics`/`outcomeWindows` stay keyed by URL and don't need touching.
+        for i in nodes.indices {
+            if let updated = newByURL[nodes[i].url] {
+                nodes[i] = updated
+            }
+        }
+        if let updatedActive = newByURL[activeNode.url] {
+            activeNode = updatedActive
+        }
+
         for node in newNodes where !existingURLs.contains(node.url) {
             nodes.append(node)
             metrics[node.url] = NodeMetrics()
