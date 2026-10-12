@@ -38,6 +38,13 @@ public class Kit {
     public let nodePool: NodePool
     public weak var delegate: CapsizedMoneroKitDelegate?
 
+    /// Whether this wallet was restored from an address + view key only (no spend key),
+    /// so it can observe balances and incoming transactions but can't send. Read from the
+    /// wallet file once during `init` and never reassigned after — the underlying
+    /// `walletPointer` is cleared whenever the wallet is stopped (wallet switch, background),
+    /// so this is captured rather than read live.
+    public private(set) var isWatchOnly = false
+
     /// When false, automatic rotation off the current node on repeated sync failures is
     /// disabled — used to honor a user's manually pinned node. Gates `attemptNodeRotation()`
     /// under `.legacy` and the watchdog-driven rotation cycle under `.adaptive`.
@@ -91,8 +98,10 @@ public class Kit {
 
         try moneroCore.ensureWalletCreated()
 
+        isWatchOnly = moneroCore.isWatchOnly
+
         let accountNumber = moneroCore.numberOfAccounts()
-        
+
         for account in 0..<accountNumber {
             if storage.getAllAddresses(account: account).isEmpty {
                 // Use the live wallet pointer to derive addresses — avoids the static
@@ -101,11 +110,7 @@ public class Kit {
                 let primaryAddress = moneroCore.address(index: 0, account: account)
                 storage.add(subAddress: SubAddress(address: primaryAddress, index: 0, account: account))
 
-                if account == 0 {
-                    if case .watch = wallet {
-                        return
-                    }
-
+                if account == 0 && !isWatchOnly {
                     let firstSubAddress = moneroCore.address(index: 1, account: account)
                     storage.add(subAddress: SubAddress(address: firstSubAddress, index: 1, account: account))
                 }

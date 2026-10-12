@@ -91,6 +91,8 @@ extension MyClass: CapsizedMoneroKitDelegate {
 | `.keys(address:viewKey:spendKey:)` | Import from raw spend/view keys |
 | `.watch(address:viewKey:)` | View-only wallet (no spending) |
 
+A wallet's `Kit.isWatchOnly` is `true` when it was restored as `.watch` (or any wallet file that only has a view key). It's captured once from the wallet file during `init` and doesn't change for the lifetime of the `Kit` instance.
+
 ### Node management
 
 `Kit` supports two node-selection strategies via the `nodeRotationMode: NodeRotationMode` initializer parameter:

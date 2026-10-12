@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.1
+
+- Added `Kit.isWatchOnly`: true when the wallet was restored from an address + view key only (no spend key). Captured once from the wallet file during `init`.
+- Fixed: `Kit.init` for a `.watch` wallet returned early before `subscribeToBackgroundNotifications()` and the `.adaptive` `NodeWatchdog` were set up. It now only skips deriving the second subaddress, matching the behavior of a relaunched watch-only wallet.
+
 ## 1.1.0
 
 - Added `NodeRotationMode.adaptive`: concurrent HTTP-based node health probing (`DaemonHealthProbe`), health/latency-based scoring, and watchdog-driven automatic rotation (`NodeWatchdog`).

@@ -746,6 +746,11 @@ class MoneroCore {
         return stringFromCString(MONERO_Wallet_address(walletPointer, 0, 0))
     }
 
+    var isWatchOnly: Bool {
+        guard let walletPointer else { return false }
+        return MONERO_Wallet_watchOnly(walletPointer)
+    }
+
     var secretViewKey: String? {
         guard let walletPointer else { return nil }
         return secureStringFromCString(MONERO_Wallet_secretViewKey(walletPointer))
