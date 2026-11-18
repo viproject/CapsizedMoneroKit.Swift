@@ -16,6 +16,7 @@ class SyncStateManager {
     private var cWalletPassword: UnsafeMutablePointer<CChar>?
 
     private let queue = DispatchQueue(label: "io.capsized.monero_kit.core_state_queue", qos: .background)
+    private static let queueKey = DispatchSpecificKey<Void>()
 
     private var connectStartTime: Date?
     private var backgroundSyncSetupSuccess: Bool = false
@@ -42,12 +43,30 @@ class SyncStateManager {
     /// `.legacy` it is simply never set, so this costs nothing beyond the ring buffer upkeep.
     var onHealthSample: ((ActiveNodeSample) -> Void)?
 
-    var state: WalletState = .notSynced(error: WalletStateError.notStarted) {
+    // Backing storage is confined to `queue` via the `state` get/set below — `MoneroCore`
+    // (and `SyncStateManager`'s own reachability sink + polling loop) both mutate this from
+    // whatever thread they happen to run on, and an unsynchronized read/write race here was
+    // the root cause of a crash in `stop()` (torn write to this enum's payload).
+    private var _state: WalletState = .notSynced(error: WalletStateError.notStarted) {
         didSet {
-            if oldValue != state {
+            if oldValue != _state {
                 onSyncStateChanged?()
             }
         }
+    }
+
+    var state: WalletState {
+        get { onQueue { _state } }
+        set { onQueue { _state = newValue } }
+    }
+
+    /// Runs `work` confined to `queue`, without deadlocking if already running on `queue`
+    /// (e.g. reentrantly, from `state`'s `didSet` chain calling back into `start()`/`stop()`).
+    private func onQueue<T>(_ work: () -> T) -> T {
+        if DispatchQueue.getSpecific(key: Self.queueKey) != nil {
+            return work()
+        }
+        return queue.sync(execute: work)
     }
 
     var chunkOfBlocksSynced: Bool {
@@ -63,6 +82,8 @@ class SyncStateManager {
         self.logger = logger
         self.reachabilityManager = reachabilityManager
         self.restoreHeight = restoreHeight
+
+        queue.setSpecific(key: Self.queueKey, value: ())
 
         reachabilityManager.$isReachable
             .receive(on: queue)
@@ -197,46 +218,56 @@ class SyncStateManager {
     }
 
     func validateReachable() {
-        if !reachabilityManager.isReachable {
-            state = .idle(daemonReachable: false)
+        onQueue {
+            if !reachabilityManager.isReachable {
+                state = .idle(daemonReachable: false)
+            }
         }
     }
 
     func start(walletPointer: UnsafeMutableRawPointer?, cWalletPassword: UnsafeMutablePointer<CChar>?) {
         guard let walletPointer, let cWalletPassword else { return }
 
-        if isRunning { return }
-        isRunning = true
+        onQueue {
+            if isRunning { return }
+            isRunning = true
 
-        self.walletPointer = walletPointer
-        self.cWalletPassword = cWalletPassword
-        connectStartTime = Date()
+            self.walletPointer = walletPointer
+            self.cWalletPassword = cWalletPassword
+            connectStartTime = Date()
 
-        scheduleNextCheck()
+            scheduleNextCheck()
+        }
     }
 
     func stop() {
-        isRunning = false
+        onQueue {
+            isRunning = false
 
-        connectStartTime = nil
+            connectStartTime = nil
 
-        walletPointer = nil
-        cWalletPassword = nil
+            walletPointer = nil
+            cWalletPassword = nil
 
-        // Otherwise a fresh session's first blocksPerSecond reading would span the gap
-        // across the restart, looking like a valid measurement when it is not.
-        heightSamples.removeAll()
+            // Otherwise a fresh session's first blocksPerSecond reading would span the gap
+            // across the restart, looking like a valid measurement when it is not.
+            heightSamples.removeAll()
+        }
     }
 
     func walletStored() {
-        lastStoredBlockHeight = walletHeight
+        onQueue {
+            lastStoredBlockHeight = walletHeight
+        }
     }
 
     /// Corrects the restore height after the C++ wallet file has been opened.
     /// For existing wallets the caller may have passed today's block height as a
     /// placeholder; this updates it to the value actually stored in the file.
     func updateRestoreHeight(_ height: UInt64) {
-        restoreHeight = height
+        onQueue {
+            restoreHeight = height
+        }
     }
 
     enum BackgroundSyncType: Int32 {
