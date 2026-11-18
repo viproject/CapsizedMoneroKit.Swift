@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.2
+
+- Fixed: a crash in `SyncStateManager.stop()` caused by a data race. `state` and related sync bookkeeping (`isRunning`, wallet pointers, height samples, restore height) were read and written from whichever thread `MoneroCore` or the reachability sink ran on. A concurrent write could tear the `WalletState` enum payload. All access is now confined to the manager's serial queue, with reentrancy handled so `state`'s `didSet` callbacks can call back into `start()`/`stop()` without deadlocking. No public API changes.
+
 ## 1.1.1
 
 - Added `Kit.isWatchOnly`: true when the wallet was restored from an address + view key only (no spend key). Captured once from the wallet file during `init`.
